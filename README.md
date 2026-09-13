@@ -289,7 +289,7 @@ If the Frappe bench and site already exist, copy this block and replace only `YO
 ```bash
 cd ~/frappe-bench
 
-bench get-app https://github.com/laxminarayan-dev/frappe_docai.git --branch version-16
+bench get-app https://github.com/laxminarayan-dev/frappe_docai.git --branch version-1
 
 bench pip install google-cloud-documentai
 
@@ -374,7 +374,7 @@ https://github.com/laxminarayan-dev/frappe_docai
 Branch:
 
 ```text
-version-16
+version-1
 ```
 
 License:
