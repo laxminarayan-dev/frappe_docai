@@ -1,0 +1,127 @@
+{
+ "actions": [],
+ "allow_bulk_edit": 1,
+ "allow_rename": 1,
+ "creation": "2026-09-12 17:58:19.731422",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_break_tpbw",
+  "enabled",
+  "project_id",
+  "processor_id",
+  "connection_status",
+  "column_break_jhnm",
+  "location",
+  "credentials_json",
+  "last_connection_test",
+  "processor_version",
+  "section_break_lrwc",
+  "schema_json",
+  "column_break_dpaq",
+  "extraction_instructions"
+ ],
+ "fields": [
+  {
+   "default": "1",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enabled"
+  },
+  {
+   "fieldname": "project_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Google Cloud Project ID",
+   "reqd": 1
+  },
+  {
+   "fieldname": "location",
+   "fieldtype": "Data",
+   "label": "Google Cloud Location",
+   "reqd": 1
+  },
+  {
+   "fieldname": "processor_id",
+   "fieldtype": "Data",
+   "label": "Processor ID",
+   "reqd": 1
+  },
+  {
+   "fieldname": "credentials_json",
+   "fieldtype": "Attach",
+   "label": "Google Credentials JSON",
+   "reqd": 1
+  },
+  {
+   "fieldname": "connection_status",
+   "fieldtype": "Small Text",
+   "label": "Connection Status",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_connection_test",
+   "fieldtype": "Datetime",
+   "label": "Last Connection Test",
+   "read_only": 1
+  },
+  {
+   "fieldname": "extraction_instructions",
+   "fieldtype": "Text",
+   "label": "Extraction Instructions"
+  },
+  {
+   "fieldname": "section_break_lrwc",
+   "fieldtype": "Section Break"
+  },
+  {
+   "default": "{\n  \"displayName\": \"Vendor Invoice Schema\",\n  \"description\": \"Schema for extracting vendor invoice information\",\n  \"documentPrompt\": \"This document is a vendor invoice. Extract the invoice information accurately. Do not guess values that are not present.\",\n  \"entityTypes\": [\n    {\n      \"type\": \"invoice_number\",\n      \"displayName\": \"Invoice Number\",\n      \"description\": \"Extract the invoice number exactly as printed on the invoice.\",\n      \"valueType\": \"string\",\n      \"occurrenceType\": \"REQUIRED_ONCE\"\n    },\n    {\n      \"type\": \"invoice_date\",\n      \"displayName\": \"Invoice Date\",\n      \"description\": \"Extract the invoice issue date. Do not use the due date.\",\n      \"valueType\": \"date\",\n      \"occurrenceType\": \"REQUIRED_ONCE\"\n    },\n    {\n      \"type\": \"supplier_name\",\n      \"displayName\": \"Supplier Name\",\n      \"description\": \"Extract the legal or business name of the supplier.\",\n      \"valueType\": \"string\",\n      \"occurrenceType\": \"REQUIRED_ONCE\"\n    },\n    {\n      \"type\": \"supplier_gstin\",\n      \"displayName\": \"Supplier GSTIN\",\n      \"description\": \"Extract the supplier GSTIN exactly as printed.\",\n      \"valueType\": \"string\",\n      \"occurrenceType\": \"OPTIONAL_ONCE\"\n    },\n    {\n      \"type\": \"total_amount\",\n      \"displayName\": \"Total Amount\",\n      \"description\": \"Extract the final invoice total including applicable taxes.\",\n      \"valueType\": \"money\",\n      \"occurrenceType\": \"REQUIRED_ONCE\"\n    }\n  ]\n}",
+   "fieldname": "schema_json",
+   "fieldtype": "Code",
+   "label": "JSON Schema"
+  },
+  {
+   "fieldname": "column_break_dpaq",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "section_break_tpbw",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "column_break_jhnm",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "processor_version",
+   "fieldtype": "Data",
+   "label": "Processor Version"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-09-12 20:45:46.306131",
+ "modified_by": "Administrator",
+ "module": "Frappe Document AI",
+ "name": "Document AI Configuration",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}
