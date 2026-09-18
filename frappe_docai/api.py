@@ -2,6 +2,7 @@ import base64
 import json
 import re
 from collections import defaultdict
+from datetime import datetime
 
 import frappe
 from google.auth.transport.requests import AuthorizedSession
@@ -105,6 +106,7 @@ VALID_TYPES = {
     "NUMBER",
     "BOOLEAN",
     "INTEGER",
+    "DATE",
 }
 
 VALID_OCCURRENCES = {
@@ -418,6 +420,155 @@ def clean_number(value):
         return None
 
 
+def normalize_date(value):
+    if value is None:
+        return None
+
+    text = clean_text(value)
+
+    if not text:
+        return None
+
+    text = re.sub(
+        r"(\d)(st|nd|rd|th)\b",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    formats = (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d %B %Y",
+        "%d %b %Y",
+        "%B %d %Y",
+        "%B %d, %Y",
+        "%b %d %Y",
+        "%b %d, %Y",
+        "%d-%B-%Y",
+        "%d-%b-%Y",
+        "%d/%B/%Y",
+        "%d/%b/%Y",
+    )
+
+    for date_format in formats:
+        try:
+            return datetime.strptime(
+                text,
+                date_format,
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    numeric_parts = re.split(
+        r"[./-]",
+        text,
+    )
+
+    if len(numeric_parts) == 3 and all(
+        part.isdigit()
+        for part in numeric_parts
+    ):
+        first, second, third = numeric_parts
+
+        if len(first) == 4:
+            year, month, day = first, second, third
+        elif len(third) == 4:
+            year = third
+
+            if int(first) > 12:
+                day, month = first, second
+            elif int(second) > 12:
+                month, day = first, second
+            else:
+                return None
+        else:
+            return None
+
+        try:
+            return datetime.strptime(
+                f"{year}-{month}-{day}",
+                "%Y-%m-%d",
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    return None
+
+
+def extract_invoice_date_from_text(document_text):
+    for line in str(
+        document_text or ""
+    ).splitlines():
+        normalized_line = line.strip()
+        lowered_line = normalized_line.lower()
+
+        if not normalized_line:
+            continue
+
+        if any(
+            excluded in lowered_line
+            for excluded in (
+                "due date",
+                "order date",
+                "delivery date",
+                "supply date",
+                "payment date",
+            )
+        ):
+            continue
+
+        if not re.search(
+            r"\b(invoice\s+date|tax\s+invoice\s+date|"
+            r"bill\s+date|issued\s+on|date)\b",
+            lowered_line,
+        ):
+            continue
+
+        candidate = re.sub(
+            r"^.*?\b(invoice\s+date|tax\s+invoice\s+date|"
+            r"bill\s+date|issued\s+on|date)\b\s*[:\-]?\s*",
+            "",
+            normalized_line,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+        date = normalize_date(candidate)
+
+        if date:
+            return date
+
+    date_pattern = re.compile(
+        r"\b(invoice\s+date|tax\s+invoice\s+date|"
+        r"bill\s+date|issued\s+on|date)\b\s*[:\-]?\s*"
+        r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}\s+\d{4}|"
+        r"[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|"
+        r"\d{1,2}[/-]\d{1,2}[/-]\d{4}|"
+        r"\d{4}-\d{1,2}-\d{1,2})",
+        flags=re.IGNORECASE,
+    )
+
+    for match in date_pattern.finditer(
+        str(document_text or "")
+    ):
+        context = str(
+            document_text or ""
+        )[max(0, match.start() - 20):match.end()].lower()
+
+        if "due date" in context:
+            continue
+
+        date = normalize_date(
+            match.group(2)
+        )
+
+        if date:
+            return date
+
+    return None
+
+
 def normalize_value(
     value,
     value_type,
@@ -431,6 +582,9 @@ def normalize_value(
         "INTEGER",
     }:
         return clean_number(value)
+
+    if value_type == "DATE":
+        return normalize_date(value)
 
     if value_type == "BOOLEAN":
 
@@ -528,6 +682,66 @@ def get_entity_text(
 
     return clean_text(
         "".join(parts)
+    )
+
+
+def get_entity_value(
+    entity,
+    document_text,
+    field_name,
+    field_type,
+):
+    is_date = (
+        normalize_type(field_type) == "DATE"
+        or field_name.lower()
+        in {
+            "date",
+            "invoice_date",
+            "invoice_issue_date",
+        }
+    )
+
+    if is_date:
+        normalized = (
+            entity.get(
+                "normalizedValue"
+            )
+            or {}
+        )
+
+        date_value = (
+            normalized.get(
+                "dateValue"
+            )
+            or {}
+        )
+
+        if all(
+            date_value.get(key)
+            for key in (
+                "year",
+                "month",
+                "day",
+            )
+        ):
+            return (
+                f"{int(date_value['year']):04d}-"
+                f"{int(date_value['month']):02d}-"
+                f"{int(date_value['day']):02d}"
+            )
+
+        normalized_text = normalized.get(
+            "text"
+        )
+
+        if normalized_text:
+            return clean_text(
+                normalized_text
+            )
+
+    return get_entity_text(
+        entity,
+        document_text,
     )
 
 
@@ -1651,23 +1865,51 @@ def parse_root_entities(
             or {}
         )
 
-        raw_value = get_entity_text(
+        field_type = field_config.get(
+            "type",
+            "STRING",
+        )
+
+        raw_value = get_entity_value(
             entity,
             document_text,
+            entity_type,
+            field_type,
         )
 
         value = normalize_value(
             raw_value,
-            field_config.get(
-                "type",
-                "STRING",
-            ),
+            field_type,
         )
 
         if value is not None:
             result[
                 entity_type
             ] = value
+
+    date_field = next(
+        (
+            field_name
+            for field_name in configured_fields
+            if field_name.lower()
+            in {
+                "date",
+                "invoice_date",
+                "invoice_issue_date",
+            }
+        ),
+        None,
+    )
+
+    if date_field and not result.get(date_field):
+        date = extract_invoice_date_from_text(
+            document_text
+        )
+
+        if date:
+            result[
+                date_field
+            ] = date
 
     return result
 
@@ -1847,11 +2089,39 @@ def process_invoice_with_docai(
         config
     )
 
-    response = session.post(
-        endpoint,
-        json=request_body,
-        timeout=120,
-    )
+    retryable_statuses = {
+        429,
+        500,
+        502,
+        503,
+        504,
+    }
+
+    response = None
+
+    for attempt in range(3):
+        try:
+            response = session.post(
+                endpoint,
+                json=request_body,
+                timeout=120,
+            )
+        except Exception as error:
+            if attempt == 2:
+                frappe.throw(
+                    "Google Document AI request failed: "
+                    f"{error}"
+                )
+
+            continue
+
+        if response.status_code not in retryable_statuses:
+            break
+
+    if response is None:
+        frappe.throw(
+            "Google Document AI returned no response."
+        )
 
     if response.status_code != 200:
 
@@ -1861,7 +2131,18 @@ def process_invoice_with_docai(
             f"{response.text}"
         )
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError as error:
+        frappe.throw(
+            "Google Document AI returned invalid JSON: "
+            f"{error}"
+        )
+
+    if not isinstance(data, dict):
+        frappe.throw(
+            "Google Document AI returned an invalid response."
+        )
 
     document = (
         data.get(
@@ -1869,6 +2150,11 @@ def process_invoice_with_docai(
         )
         or {}
     )
+
+    if not isinstance(document, dict) or not document:
+        frappe.throw(
+            "Google Document AI returned no processed document."
+        )
 
     # --------------------------------------------------------
     # ROOT FIELDS
@@ -1897,7 +2183,7 @@ def process_invoice_with_docai(
         # PRIMARY:
         # Document AI table rows
         line_items = (
-            extract_line_items_from_tables(
+            build_line_items_from_entities(
                 document,
                 line_item_name,
                 line_item_properties,
@@ -1909,7 +2195,7 @@ def process_invoice_with_docai(
         if not line_items:
 
             line_items = (
-                build_line_items_from_entities(
+                extract_line_items_from_tables(
                     document,
                     line_item_name,
                     line_item_properties,
