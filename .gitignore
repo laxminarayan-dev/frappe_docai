@@ -57,3 +57,14 @@ jspm_packages/
 # Python cache
 __pycache__/
 *.py[cod]
+
+# Cloud credentials and secrets
+**/*service-account*.json
+**/*gcp*.json
+**/*google*.json
+**/credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt

@@ -1,6 +1,7 @@
 import base64
 import json
 import re
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -2317,3 +2318,707 @@ def test_connection():
 @frappe.whitelist()
 def process_invoice(file_url):
     return process_invoice_with_docai(file_url)
+
+
+
+OCR_API_LOG_DOCTYPE = "OCR API Log"
+
+# Snapshot exchange rate used for estimated INR cost logging.
+USD_TO_INR_RATE = 95.82
+
+# Google Agent Platform on-demand pricing.
+MODEL_PRICING_USD_PER_MILLION = {
+    "gemini-3.5-flash-lite": {
+        "input": 0.30,
+        "output": 2.50,
+    },
+}
+
+
+def _ocr_log_json(value):
+    if value is None:
+        return None
+
+    try:
+        return frappe.as_json(value, indent=2)
+    except Exception:
+        return str(value)
+
+
+def _ocr_log_create(values):
+    try:
+        doc = frappe.get_doc({
+            "doctype": OCR_API_LOG_DOCTYPE,
+            **values,
+        })
+
+        doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+
+        return doc.name
+
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            "OCR API Log Creation Failed",
+        )
+
+        return None
+
+
+def _ocr_log_update(name, values):
+    if not name:
+        return
+
+    try:
+        frappe.db.set_value(
+            OCR_API_LOG_DOCTYPE,
+            name,
+            values,
+            update_modified=False,
+        )
+
+        frappe.db.commit()
+
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            "OCR API Log Update Failed",
+        )
+
+
+def _ocr_usage_summary(provider):
+    usage = (
+        getattr(
+            provider,
+            "last_usage_metadata",
+            None,
+        )
+        or {}
+    )
+
+    input_tokens = int(
+        usage.get(
+            "promptTokenCount",
+            0,
+        )
+        or 0
+    )
+
+    output_tokens = int(
+        usage.get(
+            "candidatesTokenCount",
+            0,
+        )
+        or 0
+    )
+
+    thinking_tokens = int(
+        usage.get(
+            "thoughtsTokenCount",
+            0,
+        )
+        or 0
+    )
+
+    total_tokens = int(
+        usage.get(
+            "totalTokenCount",
+            0,
+        )
+        or (
+            input_tokens
+            + output_tokens
+            + thinking_tokens
+        )
+    )
+
+    model = str(
+        getattr(
+            provider,
+            "model",
+            "",
+        )
+        or ""
+    ).lower()
+
+    pricing = MODEL_PRICING_USD_PER_MILLION.get(
+        model
+    )
+
+    credits = None
+
+    if pricing is not None and usage:
+
+        usd = (
+            (
+                input_tokens
+                * pricing["input"]
+            )
+            / 1_000_000
+            +
+            (
+                output_tokens
+                + thinking_tokens
+            )
+            * pricing["output"]
+            / 1_000_000
+        )
+
+        credits = {
+            "estimated": True,
+            "currency": "INR",
+            "usd": round(
+                usd,
+                8,
+            ),
+            "inr": round(
+                usd * USD_TO_INR_RATE,
+                4,
+            ),
+            "usd_to_inr_rate": USD_TO_INR_RATE,
+            "pricing_model": model,
+            "pricing_basis": (
+                "Google Agent Platform "
+                "on-demand standard pricing"
+            ),
+        }
+
+    return {
+        "usage_metadata": usage,
+        "token_usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "thinking_tokens": thinking_tokens,
+            "total_tokens": total_tokens,
+        },
+        "credits": credits,
+    }
+
+
+@frappe.whitelist()
+def process(file_url=None, configuration=None, options=None):
+    """V3 generic direct-document processing entry point.
+
+    Sends the original document directly to the configured Gemini semantic
+    provider. Google Vision OCR is intentionally not used in this pipeline.
+    """
+    process_start = time.perf_counter()
+
+    if not file_url:
+        frappe.throw("file_url is required.")
+
+    if not configuration:
+        frappe.throw("configuration is required.")
+
+    try:
+        parsed_options = json.loads(options) if isinstance(options, str) else (options or {})
+    except (TypeError, ValueError):
+        frappe.throw("options must be a valid JSON object or dictionary.")
+
+    log_name = _ocr_log_create({
+        "api_method": "frappe_docai.api.process",
+        "file_url": file_url,
+        "configuration": configuration,
+        "status": "Started",
+        "request_options": _ocr_log_json(
+            parsed_options
+        ),
+    })
+
+    config = frappe.get_doc("OCR Configuration", configuration)
+
+    if not config.enabled:
+        frappe.throw(f"OCR Configuration {configuration} is disabled.")
+
+    connection = frappe.get_doc(
+        "Google Cloud Connection",
+        config.google_cloud_connection,
+    )
+
+    if not connection.enabled:
+        frappe.throw(
+            f"Google Cloud Connection {connection.name} is disabled."
+        )
+
+    if not connection.service_account_json:
+        frappe.throw(
+            "Google Cloud Connection is missing the uploaded service-account JSON file."
+        )
+
+    from frappe_docai.services.extractor import SemanticExtractor, get_schema_array_fields
+    from frappe_docai.services.financial_validator import validate_and_correct
+    from frappe_docai.services.semantic_provider import create_semantic_provider
+    from frappe_docai.services.validator import validate_extraction
+
+    # --------------------------------------------------------
+    # GET ORIGINAL FRAPPE FILE
+    # --------------------------------------------------------
+
+    file_doc = frappe.get_doc(
+        "File",
+        {"file_url": file_url},
+    )
+
+    if file_doc.is_private:
+        file_path = frappe.get_site_path(
+            "private",
+            "files",
+            file_doc.file_name,
+        )
+    else:
+        file_path = frappe.get_site_path(
+            "public",
+            "files",
+            file_doc.file_name,
+        )
+
+    if not frappe.os.path.exists(file_path):
+        frappe.throw(f"Document file not found: {file_path}")
+
+    with open(file_path, "rb") as file_handle:
+        document_bytes = file_handle.read()
+
+    if not document_bytes:
+        frappe.throw("Document file is empty.")
+
+    # --------------------------------------------------------
+    # MIME TYPE
+    # --------------------------------------------------------
+
+    filename = (file_doc.file_name or "").lower()
+
+    if filename.endswith(".pdf"):
+        mime_type = "application/pdf"
+    elif filename.endswith(".png"):
+        mime_type = "image/png"
+    elif filename.endswith((".jpg", ".jpeg")):
+        mime_type = "image/jpeg"
+    elif filename.endswith((".tif", ".tiff")):
+        mime_type = "image/tiff"
+    elif filename.endswith(".webp"):
+        mime_type = "image/webp"
+    else:
+        frappe.throw(
+            f"Unsupported document type: {file_doc.file_name}"
+        )
+
+    # --------------------------------------------------------
+    # SCHEMA
+    # --------------------------------------------------------
+
+    schema_raw = config.output_schema or ""
+
+    if schema_raw:
+        try:
+            schema_config = json.loads(schema_raw)
+        except (TypeError, ValueError) as exc:
+            frappe.throw(
+                f"OCR Configuration output schema is invalid JSON: {exc}"
+            )
+
+        if not isinstance(schema_config, dict):
+            frappe.throw(
+                "OCR Configuration output schema must parse to a JSON object."
+            )
+    else:
+        schema_config = {
+            "invoice_number": {"type": "string"},
+            "supplier": {"type": "string"},
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "qty": {"type": "number"},
+                        "rate": {"type": "number"},
+                        "amount": {"type": "number"},
+                    },
+                },
+            },
+        }
+
+    extraction_instructions = (
+        config.extraction_instructions
+        or "Extract all structured document fields and all physical line items."
+    )
+
+    # --------------------------------------------------------
+    # GEMINI PROVIDER
+    # --------------------------------------------------------
+
+    semantic_provider = create_semantic_provider(
+        configuration={
+            "semantic_provider": getattr(config, "semantic_provider", None),
+            "semantic_model": getattr(config, "semantic_model", None),
+            "semantic_location": getattr(config, "semantic_location", None),
+            "semantic_endpoint": getattr(config, "semantic_endpoint", None),
+        },
+        connection={
+            "service_account_json": connection.service_account_json,
+            "google_cloud_project_id": connection.google_cloud_project_id,
+        },
+    )
+
+    _ocr_log_update(
+        log_name,
+        {
+            "provider": (
+                getattr(
+                    semantic_provider,
+                    "__class__",
+                    type(semantic_provider),
+                ).__name__
+            ),
+            "model": getattr(
+                semantic_provider,
+                "model",
+                None,
+            ),
+            "status": "Processing",
+        },
+    )
+
+    # --------------------------------------------------------
+    # DIRECT DOCUMENT EXTRACTION
+    # --------------------------------------------------------
+
+    try:
+
+        extracted = SemanticExtractor(
+            {
+                "extraction_instructions": extraction_instructions,
+            },
+            provider=semantic_provider,
+        ).extract(
+            {
+                "document_bytes": document_bytes,
+                "mime_type": mime_type,
+                "file_name": file_doc.file_name,
+            },
+            schema=schema_config,
+            instructions=extraction_instructions,
+        )
+
+        # --------------------------------------------------------
+        # FINANCIAL VALIDATION
+        # --------------------------------------------------------
+
+        financial_result = validate_and_correct(
+            extracted,
+            schema=schema_config,
+        )
+
+        corrected_extracted = financial_result["data"]
+
+        array_fields = get_schema_array_fields(
+            schema_config
+        )
+
+        validation = validate_extraction(
+            corrected_extracted,
+            detected_rows=None,
+            item_field=(
+                array_fields[0]
+                if len(array_fields) == 1
+                else None
+            ),
+        )
+
+    except Exception as exc:
+
+        timings = {
+            "gemini_request_time": getattr(
+                semantic_provider,
+                "last_request_time",
+                None,
+            ),
+            "total_processing_time": (
+                time.perf_counter()
+                - process_start
+            ),
+        }
+
+        usage_info = _ocr_usage_summary(
+            semantic_provider
+        )
+
+        _ocr_log_update(
+            log_name,
+            {
+                "status": "Failed",
+
+                "raw_response": _ocr_log_json(
+                    getattr(
+                        semantic_provider,
+                        "last_raw_response",
+                        None,
+                    )
+                ),
+
+                "extracted_json": _ocr_log_json(
+                    locals().get("extracted")
+                ),
+
+                "corrected_json": _ocr_log_json(
+                    locals().get(
+                        "corrected_extracted"
+                    )
+                ),
+
+                "validator_response": _ocr_log_json(
+                    locals().get(
+                        "financial_result"
+                    )
+                ),
+
+                "financial_validation": _ocr_log_json(
+                    (
+                        locals().get(
+                            "financial_result"
+                        )
+                        or {}
+                    ).get(
+                        "financial_validation"
+                    )
+                ),
+
+                "final_validation": _ocr_log_json(
+                    locals().get(
+                        "validation"
+                    )
+                ),
+
+                "token_usage": _ocr_log_json(
+                    usage_info[
+                        "token_usage"
+                    ]
+                ),
+
+                "credits_used_inr": _ocr_log_json(
+                    usage_info[
+                        "credits"
+                    ]
+                ),
+
+                "usage_metadata": _ocr_log_json(
+                    usage_info[
+                        "usage_metadata"
+                    ]
+                ),
+
+                "full_metadata": _ocr_log_json({
+                    "provider": (
+                        getattr(
+                            semantic_provider,
+                            "__class__",
+                            type(
+                                semantic_provider
+                            ),
+                        ).__name__
+                    ),
+                    "model": getattr(
+                        semantic_provider,
+                        "model",
+                        None,
+                    ),
+                    "location": getattr(
+                        semantic_provider,
+                        "location",
+                        None,
+                    ),
+                    "usage_metadata": usage_info[
+                        "usage_metadata"
+                    ],
+                    "token_usage": usage_info[
+                        "token_usage"
+                    ],
+                    "credits": usage_info[
+                        "credits"
+                    ],
+                    "timings": timings,
+                }),
+
+                "gemini_request_time": str(
+                    timings[
+                        "gemini_request_time"
+                    ]
+                ),
+
+                "total_processing_time": str(
+                    timings[
+                        "total_processing_time"
+                    ]
+                ),
+
+                "timings": _ocr_log_json(
+                    timings
+                ),
+
+                "error": str(exc),
+
+                "debug_information": (
+                    frappe.get_traceback()
+                ),
+            },
+        )
+
+        raise
+
+    usage_info = _ocr_usage_summary(
+        semantic_provider
+    )
+
+    timings = {
+        "gemini_request_time": getattr(
+            semantic_provider,
+            "last_request_time",
+            None,
+        ),
+        "total_processing_time": (
+            time.perf_counter()
+            - process_start
+        ),
+    }
+
+    _ocr_log_update(
+        log_name,
+        {
+            "status": "Success",
+
+            "raw_response": _ocr_log_json(
+                getattr(
+                    semantic_provider,
+                    "last_raw_response",
+                    None,
+                )
+            ),
+
+            "extracted_json": _ocr_log_json(
+                extracted
+            ),
+
+            "corrected_json": _ocr_log_json(
+                corrected_extracted
+            ),
+
+            "validator_response": _ocr_log_json(
+                financial_result
+            ),
+
+            "financial_validation": _ocr_log_json(
+                financial_result[
+                    "financial_validation"
+                ]
+            ),
+
+            "final_validation": _ocr_log_json(
+                validation
+            ),
+
+            "token_usage": _ocr_log_json(
+                usage_info[
+                    "token_usage"
+                ]
+            ),
+
+            "credits_used_inr": _ocr_log_json(
+                usage_info[
+                    "credits"
+                ]
+            ),
+
+            "usage_metadata": _ocr_log_json(
+                usage_info[
+                    "usage_metadata"
+                ]
+            ),
+
+            "full_metadata": _ocr_log_json({
+                "provider": (
+                    getattr(
+                        semantic_provider,
+                        "__class__",
+                        type(
+                            semantic_provider
+                        ),
+                    ).__name__
+                ),
+                "model": getattr(
+                    semantic_provider,
+                    "model",
+                    None,
+                ),
+                "location": getattr(
+                    semantic_provider,
+                    "location",
+                    None,
+                ),
+                "endpoint": getattr(
+                    semantic_provider,
+                    "endpoint",
+                    None,
+                ),
+                "usage_metadata": usage_info[
+                    "usage_metadata"
+                ],
+                "token_usage": usage_info[
+                    "token_usage"
+                ],
+                "credits": usage_info[
+                    "credits"
+                ],
+                "timings": timings,
+                "file_name": file_doc.file_name,
+                "mime_type": mime_type,
+            }),
+
+            "gemini_request_time": str(
+                timings[
+                    "gemini_request_time"
+                ]
+            ),
+
+            "total_processing_time": str(
+                timings[
+                    "total_processing_time"
+                ]
+            ),
+
+            "timings": _ocr_log_json(
+                timings
+            ),
+
+            "request_options": _ocr_log_json(
+                parsed_options
+            ),
+        },
+    )
+
+    return {
+        "valid": validation.get(
+            "valid",
+            True,
+        ),
+        "configuration": config.name,
+        "file_name": file_doc.file_name,
+        "mime_type": mime_type,
+        "extracted": extracted,
+        "corrected": corrected_extracted,
+        "financial_validation": financial_result[
+            "financial_validation"
+        ],
+        "validation": validation,
+        "usageMetadata": usage_info[
+            "usage_metadata"
+        ],
+        "token_usage": usage_info[
+            "token_usage"
+        ],
+        "credits_used_inr": usage_info[
+            "credits"
+        ],
+        "timings": timings,
+    }
+
